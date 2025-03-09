@@ -1,140 +1,146 @@
-#!/usr/bin/env python3
-#I need to create a python script to run on linux on a raspberry pi, that will route all the MIDI traffic based on a configuration file
-#The configuration file will be a simple text file with the following format:
-#<source port> <destination port>
-
-import os
-import rtmidi
+import os, subprocess, sys
+import rtmidi, rtmidi.midiutil
 import re
 import time
-import threading
 
-received_count = {}
-sent_count = {}
+def get_midi_ports():
+    api = rtmidi.MidiIn()
+    inp = api.get_ports()
+    inp = [x for x in inp if "RtMidi" not in x]
+    api.delete()
+    api = rtmidi.MidiOut()
+    outp = api.get_ports()
+    outp = [x for x in outp if "RtMidi" not in x]
+    api.delete()
+    return inp, outp
 
-def main():
-    config_file = "midi_routes.txt"
-    midi_in_ports = []
-    midi_out_ports = []
-    routes = []
+src_ports = {}
+dst_ports = {}
+routes = {}
+defs = {}
+received_count = 0
 
-    # Check if config file exists, create default if not
-    if not os.path.exists(config_file):
-        print(f"Configuration file not found: {config_file}")
-        print("Creating default configuration file...")
-        midi_in = rtmidi.MidiIn()
-        available_in = midi_in.get_ports()
-        midi_out = rtmidi.MidiOut()
-        available_out = midi_out.get_ports()
+config_file = "midi_routes.txt"
+if not os.path.exists(config_file):
+    print(f"Config file {config_file} not found.")
+    exit(1)
 
-        def parse_port_info(port_str):
-            match = re.match(r'^(.*)\s+(\d+:\d+)$', port_str)
-            if match:
-                name = match.group(1)
-                num_id = match.group(2)
-                return num_id, name
-            else:
-                return port_str, port_str
+def midi_callback(event, dest_set):
+    global received_count, dst_ports
+    message, _ = event
+    received_count += 1
+    for id in dest_set:
+        if id in dst_ports:
+            dst_ports[id][0].send_message(message)
 
-        with open(config_file, "w") as f:
-            in_ids, out_ids = [], []
-
-            # Write input port comments
-            for port in available_in:
-                num_id, name = parse_port_info(port)
-                f.write(f"#{num_id} = {name}\n")
-                in_ids.append(num_id)
-            f.write("#\n")
-            # Write output port comments
-            for port in available_out:
-                num_id, name = parse_port_info(port)
-                f.write(f"#{num_id} = {name}\n")
-                out_ids.append(num_id)
-            f.write("#\n")
-
-            # Write routes using numeric IDs with "->"
-            for i_id in in_ids:
-                for o_id in out_ids:
-                    if i_id == o_id:
-                        continue
-                    f.write(f"{i_id} -> {o_id}\n")
-
-        print(f"Default configuration file created: {config_file}")
-        exit(0)
-
-    # Read routes from config
-    with open(config_file, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+re_def = re.compile(r"^\s*([a-zA-Z0-9_]+)\s*=\s*(.*)$")
+re_route = re.compile(r"^\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_, ]+)\s*$")
+with open(config_file, "r") as f:
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re_def.match(line)
+        if m:
+            id = m.group(1)
+            key = m.group(2).strip()
+            print(f"Defining {id} as {key}")
+            if id in defs:
+                print(f"Duplicate definition for {id}, ignoring the second one")
                 continue
-            source, dest = re.split(r'\s*->\s*', line)
-            routes.append((source, dest))
 
-    # Group routes by source
-    source_routes = {}
-    for source, dest in routes:
-        if source not in source_routes:
-            source_routes[source] = []
-        source_routes[source].append(dest)
-
-    out_map = {}
-    # Gather all distinct destinations
-    all_dests = {d for _, ds in source_routes.items() for d in ds}
-    for dest in all_dests:
-        mo = rtmidi.MidiOut()
-        if dest not in mo.get_ports():
-            print(f"Opening virtual port for {dest}")
-            mo.open_virtual_port(dest)
+            defs[id] = key
+            routes[id] = set()
         else:
-            print(f"Opening port for {dest}")
-            mo.open_port(mo.get_ports().index(dest))
-        out_map[dest] = mo
+            m = re_route.match(line)
+            if m:
+                src = m.group(1)
+                dst = m.group(2).split(",")
+                if src not in defs:
+                    print(f"Source {src} not defined, ignoring rule {line}")
+                else:
+                    for id in dst:
+                        id = id.strip()
+                        routes[src].add(id)
 
-    def create_midi_callback(source):
-        def midi_callback(event, dest_list):
-            message, _ = event
-            received_count[source] = received_count.get(source, 0) + 1
-            print(f"Received on {source}: {message}")
-            for d in dest_list:
-                out_map[d].send_message(message)
-                sent_count[d] = sent_count.get(d, 0) + 1
-        return midi_callback
-
-    def print_statistics():
-        while True:
-            time.sleep(10)
-            print("=== MIDI Statistics ===")
-            for src, count in received_count.items():
-                print(f"Received on {src}: {count}")
-                received_count[src] = 0
-            for dst, count in sent_count.items():
-                print(f"Sent to {dst}: {count}")
-                sent_count[dst] = 0
-
-    stats_thread = threading.Thread(target=print_statistics, daemon=True)
-    stats_thread.start()
-
-    # Open each source once
-    for source, dests in source_routes.items():
-        mid = rtmidi.MidiIn()
-        in_ports = mid.get_ports()
-        if source in in_ports:
-            idx = in_ports.index(source)
-            print(f"Opening port {source} at index {idx}")
-            mid.open_port(idx)
-        else:
-            print(f"Opening virtual port for {source}")
-            mid.open_virtual_port(source)
-        mid.set_callback(create_midi_callback(source), dests)
-        midi_in_ports.append(mid)
-
-    print("MIDI routing is active. Press Ctrl+C to stop.")
+midi_in_ports, midi_out_ports = get_midi_ports()
+print("Opening ports")
+for id, key in defs.items():
+    print(f"Searching input port '{key}' for {id}")
     try:
-        while True:
-            pass
-    except KeyboardInterrupt:
-        pass
+        src_ports[id] = rtmidi.midiutil.open_midiinput(key, interactive=False, use_virtual=False)
+        print(f"Input port found: {src_ports[id][1]}")
+        print("Setting callback")
+        src_ports[id][0].set_callback(midi_callback, routes[id])
+    except Exception as e:
+        print(f"Error opening input port: {e}")
 
-if __name__ == "__main__":
-    main()
+    print(f"Searching output port '{key}' for {id}")
+    try:
+        dst_ports[id] = rtmidi.midiutil.open_midioutput(key, interactive=False, use_virtual=False)
+        print(f"Output port found: {dst_ports[id][1]}")
+    except Exception as e:
+        print(f"Error opening output port: {e}")
+
+output = subprocess.check_output("aconnect -l", shell=True).decode()
+
+print("MIDI routing is active. Press Ctrl+C to stop.")
+try:
+    last_check = 0
+    interval = 5
+    while True:
+        if time.time() - last_check > interval:
+            print(f"{received_count/(time.time() - last_check)} msg/s")
+            last_check = time.time()
+            received_count = 0
+
+            new_output = subprocess.check_output("aconnect -l", shell=True).decode()
+            if new_output != output:
+                print("aconnect output changed, restarting")
+                os.execl(sys.executable, sys.executable, *sys.argv)
+            # try:
+            #     new_in_ports, new_out_ports = get_midi_ports()
+            # except Exception as e:
+            #     print(f"Error getting MIDI ports: {e}")
+            #     new_in_ports, new_out_ports = midi_in_ports, midi_out_ports
+            # if ",".join(new_in_ports) != ",".join(midi_in_ports) or ",".join(new_out_ports) != ",".join(midi_out_ports):
+            #     print("MIDI device change detected, restarting")
+            #     os.execl(sys.executable, sys.executable, *sys.argv)
+                # print(f"Old input ports: {repr(midi_in_ports)}")
+                # print(f"New input ports: {repr(new_in_ports)}")
+                # print(f"Old output ports: {repr(midi_out_ports)}")
+                # print(f"New output ports: {repr(new_out_ports)}")
+                # #close all ports
+                # print("Closing all ports")
+                # for source in src_ports.values():
+                #     source[0].close_port()
+                #     del source[0]
+                # src_ports.clear()
+                # for dest in dst_ports.values():
+                #     dest[0].close_port()
+                #     del dest[0]
+                # dst_ports.clear()
+
+                # midi_in_ports, midi_out_ports = new_in_ports, new_out_ports
+                # #open all valid ports
+                # print("Reopening ports")
+                # for id, key in defs.items():
+                #     print(f"Searching input port '{key}' for {id}")
+                #     try:
+                #         src_ports[id] = rtmidi.midiutil.open_midiinput(key, interactive=False, use_virtual=False)
+                #         print(f"Input port found: {src_ports[id][1]}")
+                #         print("Setting callback")
+                #         src_ports[id][0].set_callback(midi_callback, routes[id])
+                #     except Exception as e:
+                #         print(f"Error opening input port: {e}")
+
+                #     print(f"Searching output port '{key}' for {id}")
+                #     try:
+                #         dst_ports[id] = rtmidi.midiutil.open_midioutput(key, interactive=False, use_virtual=False)
+                #         print(f"Output port found: {dst_ports[id][1]}")
+                #     except Exception as e:
+                #         print(f"Error opening output port: {e}")
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    pass

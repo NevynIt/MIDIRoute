@@ -1,0 +1,11 @@
+#Device definitions
+apc25 = APC Key 25 mk2 K
+ufreak = Arturia MicroFreak
+p85 = USB MIDI Interface
+tracks = Circuit Tracks
+
+#Routes
+p85 -> ufreak, tracks
+apc25 -> tracks
+tracks -> ufreak, p85
+ufreak -> tracks
